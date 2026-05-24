@@ -2,6 +2,12 @@
 name = "notify-lsp-proxy"
 version = "0.1.0"
 edition = "2024"
+description = "LSP proxy that adds file watching"
+license = "MIT"
+repository = "https://github.com/chrinkis/notify-lsp-proxy/tree/main"
+readme = "README.md"
+keywords = ["lsp", "proxy", "helix"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
