@@ -44,7 +44,7 @@ language-servers = ["omni"]
 [language-server.omni]
 command = "notify-lsp-proxy"
 args = [
-  "--notify-open-files"
+  "--notify-open-files",
   "--",
   "OmniSharp",
   "--languageserver"
