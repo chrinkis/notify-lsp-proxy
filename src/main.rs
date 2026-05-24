@@ -1,6 +1,7 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 
 use clap::Parser;
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -8,11 +9,18 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 
 #[derive(Parser)]
 #[command(about = "LSP proxy that adds file watching on behalf of the client")]
 struct Cli {
+    /// After injecting didChangeWatchedFiles, send a no-op didChange for each
+    /// open file to force the language server to re-analyze and push diagnostics.
+    /// Workaround for OmniSharp not re-pushing diagnostics for related files
+    /// after external file changes.
+    #[arg(long, default_value_t = false)]
+    notify_open_files: bool,
+
     /// Language server binary and its arguments (everything after --)
     #[arg(last = true, required = true)]
     command: Vec<String>,
@@ -155,9 +163,103 @@ fn extract_patterns(msg: &Value) -> Vec<WatchedPattern> {
     patterns
 }
 
+fn maybe_strip_diagnostics_version(parsed: Option<Value>, raw: &[u8]) -> Bytes {
+    let mut v = match parsed {
+        Some(v) if v["method"].as_str() == Some("textDocument/publishDiagnostics") => v,
+        _ => return frame(raw),
+    };
+    if !v["params"]["version"].is_number() {
+        return frame(raw);
+    }
+    let uri = v["params"]["uri"].as_str().unwrap_or("unknown").to_string();
+    if let Some(params) = v["params"].as_object_mut() {
+        params.remove("version");
+    }
+    eprintln!("[strip-version] removed version from publishDiagnostics for {uri}");
+    match serde_json::to_vec(&v) {
+        Ok(body) => frame(&body),
+        Err(e) => {
+            eprintln!("lsp-proxy: failed to reserialize publishDiagnostics: {e}");
+            frame(raw)
+        }
+    }
+}
+
+async fn track_open_file(msg: &Value, open_files: &Mutex<HashMap<String, (String, i32)>>) {
+    match msg["method"].as_str() {
+        Some("textDocument/didOpen") => {
+            let td = &msg["params"]["textDocument"];
+            if let (Some(uri), Some(text), Some(version)) = (
+                td["uri"].as_str(),
+                td["text"].as_str(),
+                td["version"].as_i64(),
+            ) {
+                open_files
+                    .lock()
+                    .await
+                    .insert(uri.to_string(), (text.to_string(), version as i32));
+            }
+        }
+        Some("textDocument/didClose") => {
+            if let Some(uri) = msg["params"]["textDocument"]["uri"].as_str() {
+                open_files.lock().await.remove(uri);
+            }
+        }
+        Some("textDocument/didChange") => {
+            let td = &msg["params"]["textDocument"];
+            if let Some(uri) = td["uri"].as_str() {
+                let version = td["version"].as_i64().unwrap_or(0) as i32;
+                if let Some(text) = msg["params"]["contentChanges"]
+                    .as_array()
+                    .and_then(|cs| cs.last())
+                    .and_then(|c| c["text"].as_str())
+                {
+                    open_files
+                        .lock()
+                        .await
+                        .insert(uri.to_string(), (text.to_string(), version));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn nudge_open_files(
+    open_files: &Mutex<HashMap<String, (String, i32)>>,
+    tx: &mpsc::Sender<Bytes>,
+) {
+    let mut files = open_files.lock().await;
+    if files.is_empty() {
+        return;
+    }
+    let mut messages = Vec::with_capacity(files.len());
+    for (uri, (text, version)) in files.iter_mut() {
+        *version += 1;
+        eprintln!("[notify-open-files] nudging {uri}");
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didChange",
+            "params": {
+                "textDocument": { "uri": uri, "version": *version },
+                "contentChanges": [{ "text": text }]
+            }
+        });
+        match serde_json::to_vec(&notification) {
+            Ok(body) => messages.push(frame(&body)),
+            Err(e) => eprintln!("lsp-proxy: failed to serialize nudge for {uri}: {e}"),
+        }
+    }
+    drop(files); // release lock before awaiting sends
+    for msg in messages {
+        let _ = tx.send(msg).await;
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    let notify_open_files = cli.notify_open_files;
     let (bin, ls_args) = cli.command.split_first().expect("command is required");
 
     let mut ls = Command::new(bin)
@@ -180,15 +282,24 @@ async fn main() {
     let (to_client_tx, to_client_rx) = mpsc::channel::<Bytes>(128);
     // New glob patterns discovered from client/registerCapability interception
     let (pattern_tx, pattern_rx) = mpsc::channel::<Vec<WatchedPattern>>(16);
+    // URI → (content, version) for all currently open text documents
+    let open_files: Arc<Mutex<HashMap<String, (String, i32)>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     // Task: client stdin → language server stdin
     let t_client_in = {
         let tx = to_ls_tx.clone();
+        let open_files = Arc::clone(&open_files);
         tokio::spawn(async move {
             let mut reader = BufReader::new(tokio::io::stdin());
             loop {
                 match read_message(&mut reader).await {
                     Ok(Some(msg)) => {
+                        if notify_open_files {
+                            if let Ok(v) = serde_json::from_slice::<Value>(&msg) {
+                                track_open_file(&v, &open_files).await;
+                            }
+                        }
                         if tx.send(frame(&msg)).await.is_err() {
                             break;
                         }
@@ -242,7 +353,8 @@ async fn main() {
                         }
                     }
                 } else {
-                    if to_client.send(frame(&msg)).await.is_err() {
+                    let out = maybe_strip_diagnostics_version(parsed, &msg);
+                    if to_client.send(out).await.is_err() {
                         break;
                     }
                 }
@@ -279,6 +391,7 @@ async fn main() {
     // Task: watch filesystem and inject workspace/didChangeWatchedFiles notifications
     let t_watcher = {
         let tx = to_ls_tx;
+        let open_files = Arc::clone(&open_files);
         tokio::spawn(async move {
             let (notify_tx, mut notify_rx) =
                 mpsc::unbounded_channel::<notify::Result<notify::Event>>();
@@ -359,6 +472,10 @@ async fn main() {
                                     match serde_json::to_vec(&notification) {
                                         Ok(body) => { let _ = tx.send(frame(&body)).await; }
                                         Err(e) => eprintln!("lsp-proxy: failed to serialize notification: {e}"),
+                                    }
+
+                                    if notify_open_files {
+                                        nudge_open_files(&open_files, &tx).await;
                                     }
                                 }
                             }

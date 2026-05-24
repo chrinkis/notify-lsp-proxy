@@ -44,15 +44,12 @@ language-servers = ["omni"]
 [language-server.omni]
 command = "notify-lsp-proxy"
 args = [
+  "--notify-open-files"
   "--",
   "OmniSharp",
   "--languageserver"
 ]
 ```
-
-> **Note:** OmniSharp has a bug where stale diagnostics in other buffers do not
-> clear automatically after a build. Make a small edit in the affected buffer
-> (e.g. add and remove a space) to force OmniSharp to re-evaluate it.
 
 ### roslyn-language-server
 
