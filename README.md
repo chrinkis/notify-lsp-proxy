@@ -16,7 +16,7 @@ notifications directly into the language server's stdin stream.
 ## Installation
 
 ```sh
-cargo install --path .
+cargo install notify-lsp-proxy
 ```
 
 The binary is installed as `notify-lsp-proxy`.
